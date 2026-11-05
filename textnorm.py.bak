@@ -1,0 +1,120 @@
+"""Normalization helpers: company names (Cyrillic/Latin Uzbek), product names, regions, language detection."""
+import re
+
+APOS = "‘’ʻʼ`´'ʹ′"
+
+_CYR = {
+    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "yo", "ж": "j", "з": "z", "и": "i",
+    "й": "y", "к": "k", "л": "l", "м": "m", "н": "n", "о": "o", "п": "p", "р": "r", "с": "s", "т": "t",
+    "у": "u", "ф": "f", "х": "x", "ц": "ts", "ч": "ch", "ш": "sh", "щ": "sh", "ъ": "", "ы": "i", "ь": "",
+    "э": "e", "ю": "yu", "я": "ya", "ў": "o", "қ": "q", "ғ": "g", "ҳ": "h",
+}
+
+
+def translit(s: str) -> str:
+    """Cyrillic (Uzbek/Russian) -> Uzbek Latin, lowercased, apostrophes removed (o‘ -> o)."""
+    s = (s or "").lower()
+    out = "".join(_CYR.get(ch, ch) for ch in s)
+    for a in APOS:
+        out = out.replace(a, "")
+    return out
+
+
+_LEGAL = re.compile(
+    r"\b(mas\s*uliyati\s+cheklangan\s+jamiyati|masuliyati\s+cheklangan\s+jamiyati|mchj|mchjsi|oaj|aj|xk|qk|"
+    r"xususiy\s+korxona(si)?|xorijiy\s+korxona|qo?shma\s+korxona|aksiyadorlik\s+jamiyati|"
+    r"ooo|oao|zao|ao|ip|chp|llc|ltd|jsc|inc|unitar\s+korxona|davlat\s+unitar\s+korxonasi|duk|"
+    r"obshestvo\s+s\s+ogranichennoy\s+otvetstvennostyu|fermer\s+xo?jaligi|fx|stir)\b"
+)
+
+
+def norm_company(s: str) -> str:
+    s = translit(s)
+    s = re.sub(r"[«»\"“”„()]", " ", s)
+    s = _LEGAL.sub(" ", s)
+    s = re.sub(r"[^a-z0-9 ]", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+_ROMAN = {"i": "1", "ii": "2", "iii": "3", "iv": "4", "v": "5"}
+_ORD = {"перв": "1", "втор": "2", "трет": "3", "четв": "4", "пят": "5"}
+
+
+def compact_key(norm: str) -> str:
+    """Spaces/hyphens removed, so glued typos ('хлопоксырец', 'сырецспот') match the normal spelling."""
+    return re.sub(r"[\s\-]", "", norm or "")
+
+
+def norm_product(s: str) -> str:
+    """Canonical key so that '1 сорт', 'Сорт 1 сорт', '1-сорта', 'СОРТ: 1' collapse together."""
+    s = (s or "").lower().replace("ё", "е")
+    s = re.sub(r"[ ­ -‏ - ⁠﻿]", " ", s)   # invisible / odd spaces
+    for a in APOS:
+        s = s.replace(a, "")
+    s = re.sub(r"[«»\"“”„:;()\[\]{}]", " ", s)
+    # word ordinals: 'первый сорт', 'второго класса' -> 1, 2
+    s = re.sub(r"\b(перв|втор|трет|четв[её]рт|пят)\w*(?=\s*-?\s*(?:сорт|класс))",
+               lambda m: _ORD[m.group(1)[:4]] + " ", s)
+    s = re.sub(r"(?<=[а-яa-zўқғҳ])\s*-\s*(?=[а-яa-zўқғҳ])", " ", s)   # 'хлопок-сырец' == 'хлопок сырец'
+    s = re.sub(r"(сорт|класс)(?=\d)", r"\1 ", s)                        # 'Сорт1-сорта' == 'Сорт 1-сорта'
+    # Roman numerals next to сорт/класс: 'I сорт', 'Iсорт', 'сорт II', 'класс III класс' -> arabic
+    s = s.replace("і", "i")                                              # Cyrillic і -> Latin i
+    s = re.sub(r"\b(iii|ii|iv|i|v)(?=\s*-?\s*(?:сорт|класс))", lambda m: _ROMAN[m.group(1)] + " ", s)
+    s = re.sub(r"(сорт|класс)\s*-?\s*(iii|ii|iv|i|v)\b", lambda m: m.group(1) + " " + _ROMAN[m.group(2)], s)
+    s = re.sub(r"(\d+)\s*-?\s*(?:го|ой|й)?\s*(сорт|класс)\w*", r"\1 \2", s)
+    s = re.sub(r"\b(сорт|класс)\s+(\d+)\b(?!\s+(?:сорт|класс))", r"\2 \1", s)
+    s = re.sub(r"\b(сорт|класс)\s+(?=\d+\s+\1)", "", s)
+    s = re.sub(r"\b(марка|размер|тип)\b", " ", s)
+    s = re.sub(r"[^0-9a-zа-яўқғҳ.,х\- ]", " ", s)
+    s = re.sub(r"(?<!\d)[.,]|[.,](?!\d)", " ", s)
+    s = re.sub(r"\s*-\s*", "-", s)
+    return re.sub(r"\s+", " ", s).strip(" -.,")
+
+
+# region -> (canonical Uzbek Latin, Russian)
+_REGIONS = [
+    (("qoraqalpo", "каракалпак", "қорақалпо", "қорақалпоғ"), "Qoraqalpog‘iston Respublikasi", "Республика Каракалпакстан"),
+    (("andijon", "андижан", "андижон"), "Andijon viloyati", "Андижанская область"),
+    (("namangan", "наманган"), "Namangan viloyati", "Наманганская область"),
+    (("farg", "ферган", "фарғон", "фаргон"), "Farg‘ona viloyati", "Ферганская область"),
+    (("samarqand", "самарканд", "самарқанд"), "Samarqand viloyati", "Самаркандская область"),
+    (("buxoro", "бухар", "бухоро"), "Buxoro viloyati", "Бухарская область"),
+    (("navoiy", "навои", "навоий"), "Navoiy viloyati", "Навоийская область"),
+    (("qashqa", "кашкадар", "қашқадар"), "Qashqadaryo viloyati", "Кашкадарьинская область"),
+    (("surxon", "сурхандар", "сурхондар"), "Surxondaryo viloyati", "Сурхандарьинская область"),
+    (("jizzax", "джизак", "жиззах"), "Jizzax viloyati", "Джизакская область"),
+    (("sirdaryo", "сырдар", "сирдар"), "Sirdaryo viloyati", "Сырдарьинская область"),
+    (("xorazm", "хорезм", "хоразм"), "Xorazm viloyati", "Хорезмская область"),
+]
+
+
+def canon_region(s: str):
+    """Return (uz, ru) canonical region names, or (original, original) if unknown."""
+    if not s:
+        return None, None
+    low = s.lower()
+    lat = translit(s)
+    for keys, uz, ru in _REGIONS:
+        if any(k in low or k in lat for k in keys):
+            return uz, ru
+    if any(k in low or k in lat for k in ("toshkent", "тошкент", "ташкент", "tashkent")):
+        city = any(k in low or k in lat for k in ("shahr", "shahar", "город", "шаҳр", "шахр", "г.", " sh"))
+        region = any(k in low or k in lat for k in ("viloyat", "област", "вилоят"))
+        if city and not region:
+            return "Toshkent shahri", "город Ташкент"
+        if region:
+            return "Toshkent viloyati", "Ташкентская область"
+        return "Toshkent shahri", "город Ташкент"
+    return s, s
+
+
+def detect_lang(text: str) -> str:
+    """'ru', 'uz' (Latin) or 'uzc' (Uzbek Cyrillic)."""
+    t = (text or "").lower()
+    cyr = sum(1 for c in t if "а" <= c <= "я" or c in "ёўқғҳ")
+    lat = sum(1 for c in t if "a" <= c <= "z")
+    if cyr > lat:
+        if re.search(r"[ўқғҳ]", t) or re.search(r"\b(қанча|нечта|йил|бўйича|қайси|ким|бор|эди)\b", t):
+            return "uzc"
+        return "ru"
+    return "uz"

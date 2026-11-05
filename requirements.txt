@@ -1,0 +1,7 @@
+duckdb>=1.1
+pandas>=2.0
+rapidfuzz>=3.0
+aiogram>=3.7
+anthropic>=0.60
+openai>=1.40
+python-dotenv>=1.0

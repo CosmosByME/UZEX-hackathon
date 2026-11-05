@@ -1,0 +1,147 @@
+"""Telegram bot.   python bot.py
+Answers in the question's language; under each answer an expandable "Basis" block shows the filters and SQL used."""
+import asyncio
+import html
+import json
+import logging
+import re
+import time
+from collections import defaultdict, deque
+from datetime import datetime
+
+from aiogram import Bot, Dispatcher, F
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.filters import Command, CommandStart
+from aiogram.types import Message
+from aiogram.utils.chat_action import ChatActionSender
+
+import config
+from agent import UI, Agent
+from textnorm import detect_lang
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("bot")
+
+agent = Agent()
+history = defaultdict(lambda: deque(maxlen=config.HISTORY_TURNS))
+dp = Dispatcher()
+
+LABEL = {"ru": ("🔎 Основание", "SQL-запрос", "⏳ Ищу ответ в данных биржи…", "сек"),
+         "uz": ("🔎 Asos", "SQL so‘rov", "⏳ Birja ma’lumotlaridan javob qidiryapman…", "son"),
+         "uzc": ("🔎 Асос", "SQL сўров", "⏳ Биржа маълумотларидан жавоб қидиряпман…", "сон")}
+
+START = """👋 <b>UZEX bitimlar agenti / Агент по биржевым сделкам</b>
+
+Birja bitimlari reyestri (2022 – 2026, 500 000 bitim) bo‘yicha savollarga <b>faqat ma’lumotlar asosida</b> javob beraman. Ma’lumotda javob bo‘lmasa — ochiq aytaman.
+
+Отвечаю на вопросы по реестру сделок биржи <b>строго по данным</b>. Если ответа в данных нет — так и скажу. Под каждым ответом — блок «Основание»: фильтры и SQL-запрос.
+
+<b>Misollar / Примеры:</b>
+• 2025-yilda nechta bitim tuzilgan?
+• Какой товар дал наибольший оборот в 2024 году?
+• Paxta xom ashyosining 2026-yil sentyabrdagi o‘rtacha narxi qancha?
+• Топ-5 покупателей аммиачной селитры за 2023 год
+• Qaysi broker eng ko‘p bitim tuzgan?
+
+/new — yangi suhbat / новый диалог"""
+
+
+def md_to_html(text: str) -> str:
+    t = html.escape(text.strip())
+    t = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", t)
+    t = re.sub(r"(?<!\w)__(.+?)__(?!\w)", r"<b>\1</b>", t)
+    t = re.sub(r"`([^`\n]+)`", r"<code>\1</code>", t)
+    t = re.sub(r"^#{1,6}\s*(.+)$", r"<b>\1</b>", t, flags=re.M)
+    t = re.sub(r"^\s*[-*]\s+", "• ", t, flags=re.M)
+    return t
+
+
+def render(res, with_sql=True) -> str:
+    lab = LABEL.get(res.lang, LABEL["ru"])
+    body = md_to_html(res.answer)
+    parts = []
+    if res.basis:
+        parts.append(md_to_html(res.basis))
+    if with_sql and res.queries:
+        for q in res.queries[-2:]:
+            q = q.strip()
+            q = q if len(q) <= 900 else q[:900] + " …"
+            parts.append(f"<b>{lab[1]}:</b>\n<code>{html.escape(q)}</code>")
+    parts.append(f"⏱ {res.elapsed:.1f} {lab[3]}")
+    basis = f"\n\n<blockquote expandable><b>{lab[0]}</b>\n" + "\n".join(parts) + "</blockquote>"
+    return body + basis
+
+
+def log_qa(m: Message, q, res=None, err=None):
+    try:
+        config.LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        rec = {"ts": datetime.now().isoformat(timespec="seconds"), "user": m.from_user.id if m.from_user else None,
+               "username": m.from_user.username if m.from_user else None, "q": q}
+        if res:
+            rec.update(answer=res.answer, basis=res.basis, sql=res.queries, steps=res.steps, sec=round(res.elapsed, 1),
+                       verified=res.verified, unverified=res.unverified, trace=res.trace)
+        if err:
+            rec["error"] = err
+        with open(config.LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
+    except Exception:
+        log.exception("log failed")
+
+
+@dp.message(CommandStart())
+async def on_start(m: Message):
+    history[m.chat.id].clear()
+    await m.answer(START)
+
+
+@dp.message(Command("new"))
+async def on_new(m: Message):
+    history[m.chat.id].clear()
+    await m.answer("🆕 OK")
+
+
+@dp.message(F.text)
+async def on_question(m: Message, bot: Bot):
+    q = m.text.strip()
+    lang = detect_lang(q)
+    lab = LABEL.get(lang, LABEL["ru"])
+    wait = await m.reply(lab[2])
+    t0 = time.time()
+    try:
+        async with ChatActionSender.typing(bot=bot, chat_id=m.chat.id):
+            res = await asyncio.wait_for(agent.answer(q, list(history[m.chat.id])), timeout=config.HARD_TIMEOUT)
+    except asyncio.TimeoutError:
+        log_qa(m, q, err="timeout")
+        await wait.edit_text(UI.get(lang, UI["ru"])["timeout"])
+        return
+    except Exception as e:
+        log.exception("agent failed")
+        log_qa(m, q, err=repr(e))
+        await wait.edit_text(UI.get(lang, UI["ru"])["error"])
+        return
+    log_qa(m, q, res)
+    log.info("Q: %s | %.1fs | steps=%d | verified=%s", q[:80], time.time() - t0, res.steps, res.verified)
+    history[m.chat.id].append((q, res.answer))
+    text = render(res)
+    if len(text) > 4000:
+        text = render(res, with_sql=False)
+    if len(text) > 4000:
+        text = md_to_html(res.answer)[:4000]
+    try:
+        await wait.edit_text(text)
+    except Exception:
+        log.exception("HTML render failed; sending plain text")
+        await wait.edit_text((res.answer + ("\n\n" + res.basis if res.basis else ""))[:4000], parse_mode=None)
+
+
+async def main():
+    if not config.TELEGRAM_TOKEN:
+        raise SystemExit("Set TELEGRAM_TOKEN in .env")
+    bot = Bot(config.TELEGRAM_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    log.info("Bot started, model=%s/%s, db=%s", config.LLM_PROVIDER, config.LLM_MODEL, config.DB_PATH)
+    await dp.start_polling(bot, handle_as_tasks=True)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

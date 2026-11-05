@@ -1,0 +1,235 @@
+"""Telegram bot.   python bot.py
+Answers in the question's language; under each answer an expandable "Basis" block shows the filters and SQL used."""
+import asyncio
+import html
+import json
+import logging
+import re
+import time
+from collections import defaultdict, deque
+from datetime import datetime
+
+from aiogram import Bot, Dispatcher, F
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.filters import Command, CommandStart
+from aiogram.types import BotCommand, BotCommandScopeDefault, Message
+from aiogram.utils.chat_action import ChatActionSender
+
+import config
+from agent import UI, Agent
+from textnorm import detect_lang
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("bot")
+
+agent = Agent()
+history = defaultdict(lambda: deque(maxlen=config.HISTORY_TURNS))
+dp = Dispatcher()
+
+LABEL = {"ru": ("🔎 Основание", "SQL-запрос", "⏳ Ищу ответ в данных биржи…", "сек"),
+         "uz": ("🔎 Asos", "SQL so‘rov", "⏳ Birja ma’lumotlaridan javob qidiryapman…", "son"),
+         "uzc": ("🔎 Асос", "SQL сўров", "⏳ Биржа маълумотларидан жавоб қидиряпман…", "сон")}
+
+START = """👋 <b>UZEX bitimlar agenti / Агент по биржевым сделкам</b>
+
+Birja bitimlari reyestri (2022 – 2026, 500 000 bitim) bo‘yicha savollarga <b>faqat ma’lumotlar asosida</b> javob beraman. Ma’lumotda javob bo‘lmasa — ochiq aytaman.
+
+Отвечаю на вопросы по реестру сделок биржи <b>строго по данным</b>. Если ответа в данных нет — так и скажу. Под каждым ответом — блок «Основание»: фильтры и SQL-запрос.
+
+<b>Misollar / Примеры:</b>
+• 2025-yilda nechta bitim tuzilgan?
+• Какой товар дал наибольший оборот в 2024 году?
+• Paxta xom ashyosining 2026-yil sentyabrdagi o‘rtacha narxi qancha?
+• Топ-5 покупателей аммиачной селитры за 2023 год
+• Qaysi broker eng ko‘p bitim tuzgan?
+
+/new — yangi suhbat / новый диалог
+/team_info — jamoa haqida / о команде
+/help — yordam / помощь"""
+
+TEAM_INFO = """👥 <b>Jamoa / Команда</b>
+
+👑 <b>Team leader:</b> Saidjanov Jahongir
+🤖 <b>Bot developer:</b> Murodkulov Nazarbek
+🧠 <b>AI Engineer:</b> Egamov Muhammad
+
+<i>UZEX AI Hackathon 2026</i>"""
+
+# Menu shown when the user types "/" (default = Uzbek, Russian for ru-language clients)
+COMMANDS = {
+    None: [("start", "Botni ishga tushirish"),
+           ("new", "Yangi suhbat boshlash"),
+           ("help", "Yordam va savol misollari"),
+           ("team_info", "Jamoa a’zolari")],
+    "ru": [("start", "Запустить бота"),
+           ("new", "Начать новый диалог"),
+           ("help", "Помощь и примеры вопросов"),
+           ("team_info", "Состав команды")],
+}
+
+
+async def setup_commands(bot: Bot):
+    for lang, cmds in COMMANDS.items():
+        await bot.set_my_commands([BotCommand(command=c, description=d) for c, d in cmds],
+                                  scope=BotCommandScopeDefault(), language_code=lang)
+
+
+def md_to_html(text: str) -> str:
+    t = html.escape(text.strip())
+    t = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", t)
+    t = re.sub(r"(?<!\w)__(.+?)__(?!\w)", r"<b>\1</b>", t)
+    t = re.sub(r"`([^`\n]+)`", r"<code>\1</code>", t)
+    t = re.sub(r"^#{1,6}\s*(.+)$", r"<b>\1</b>", t, flags=re.M)
+    t = re.sub(r"^\s*[-*]\s+", "• ", t, flags=re.M)
+    return t
+
+
+_SQL_BREAK = re.compile(r"\s+(?=(?:WITH|SELECT|FROM|WHERE|GROUP BY|ORDER BY|HAVING|LIMIT|UNION(?: ALL)?|"
+                        r"(?:LEFT |RIGHT |INNER |FULL )?JOIN|QUALIFY)\b)", re.I)
+
+
+def pretty_sql(q: str) -> str:
+    """One-line SQL from the model -> one clause per line, so it reads well in a Telegram code block."""
+    q = q.strip()
+    if "\n" not in q and len(q) > 60:
+        q = _SQL_BREAK.sub("\n", q)
+        q = re.sub(r"\s+(AND|OR)\s+", r"\n  \1 ", q) if len(q) > 200 else q
+    return q.strip()
+
+
+# How SQL is placed: "inside" = code block inside the collapsible quote; "after" = code block right below the quote.
+# If Telegram rejects the nested layout once, we switch to "after" for the rest of the run.
+SQL_LAYOUT = {"mode": "inside"}
+
+
+def render(res, with_sql=True, layout=None) -> str:
+    lab = LABEL.get(res.lang, LABEL["ru"])
+    layout = layout or SQL_LAYOUT["mode"]
+    body = md_to_html(res.answer)
+    parts = []
+    if res.basis:
+        parts.append(md_to_html(res.basis))
+    code = []
+    if with_sql and res.queries:
+        for q in res.queries[-2:]:
+            q = pretty_sql(q)
+            q = q if len(q) <= 900 else q[:900] + " …"
+            code.append(f'<pre><code class="language-sql">{html.escape(q, quote=False)}</code></pre>')
+    timing = f"⏱ {res.elapsed:.1f} {lab[3]}"
+    if code and layout == "inside":
+        inner = "\n".join(parts + [f"<b>{lab[1]}:</b>"]) + "\n" + "".join(code) + timing
+        return body + f"\n\n<blockquote expandable><b>{lab[0]}</b>\n{inner}</blockquote>"
+    basis = f"\n\n<blockquote expandable><b>{lab[0]}</b>\n" + "\n".join(parts + [timing]) + "</blockquote>"
+    if code:
+        basis += f"\n<b>{lab[1]}:</b>" + "".join(code)
+    return body + basis
+
+
+def fit(res, layout=None) -> str:
+    text = render(res, layout=layout)
+    if len(text) > 4000:
+        text = render(res, with_sql=False)
+    if len(text) > 4000:
+        text = md_to_html(res.answer)[:4000]
+    return text
+
+
+def log_qa(m: Message, q, res=None, err=None):
+    try:
+        config.LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        rec = {"ts": datetime.now().isoformat(timespec="seconds"), "user": m.from_user.id if m.from_user else None,
+               "username": m.from_user.username if m.from_user else None, "q": q}
+        if res:
+            rec.update(answer=res.answer, basis=res.basis, sql=res.queries, steps=res.steps, sec=round(res.elapsed, 1),
+                       verified=res.verified, unverified=res.unverified, trace=res.trace)
+        if err:
+            rec["error"] = err
+        with open(config.LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
+    except Exception:
+        log.exception("log failed")
+
+
+@dp.message(CommandStart())
+async def on_start(m: Message):
+    history[m.chat.id].clear()
+    await m.answer(START)
+
+
+@dp.message(Command("new"))
+async def on_new(m: Message):
+    history[m.chat.id].clear()
+    await m.answer("🆕 Yangi chat boshlandi | Начался новый чат")
+
+
+@dp.message(Command("help"))
+async def on_help(m: Message):
+    await m.answer(START)
+
+
+@dp.message(Command("team_info"))
+async def on_team_info(m: Message):
+    await m.answer(TEAM_INFO)
+
+
+@dp.message(F.text.startswith("/"))
+async def on_unknown_command(m: Message):
+    await m.answer("❓ Noma’lum buyruq / Неизвестная команда. /help")
+
+
+@dp.message(F.text)
+async def on_question(m: Message, bot: Bot):
+    q = m.text.strip()
+    lang = detect_lang(q)
+    lab = LABEL.get(lang, LABEL["ru"])
+    wait = await m.reply(lab[2])
+    t0 = time.time()
+    try:
+        async with ChatActionSender.typing(bot=bot, chat_id=m.chat.id):
+            res = await asyncio.wait_for(agent.answer(q, list(history[m.chat.id])), timeout=config.HARD_TIMEOUT)
+    except asyncio.TimeoutError:
+        log_qa(m, q, err="timeout")
+        await wait.edit_text(UI.get(lang, UI["ru"])["timeout"])
+        return
+    except Exception as e:
+        log.exception("agent failed")
+        log_qa(m, q, err=repr(e))
+        await wait.edit_text(UI.get(lang, UI["ru"])["error"])
+        return
+    log_qa(m, q, res)
+    log.info("Q: %s | %.1fs | steps=%d | verified=%s", q[:80], time.time() - t0, res.steps, res.verified)
+    history[m.chat.id].append((q, res.answer))
+    try:
+        await wait.edit_text(fit(res))
+        return
+    except TelegramBadRequest as e:
+        if SQL_LAYOUT["mode"] == "inside" and res.queries:
+            log.warning("code block inside quote rejected (%s); switching to code block below the quote", e)
+            SQL_LAYOUT["mode"] = "after"
+            try:
+                await wait.edit_text(fit(res))
+                return
+            except Exception:
+                pass
+        log.exception("HTML render failed; sending plain text")
+    except Exception:
+        log.exception("HTML render failed; sending plain text")
+    await wait.edit_text((res.answer + ("\n\n" + res.basis if res.basis else ""))[:4000], parse_mode=None)
+
+
+async def main():
+    if not config.TELEGRAM_TOKEN:
+        raise SystemExit("Set TELEGRAM_TOKEN in .env")
+    bot = Bot(config.TELEGRAM_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    try:
+        await setup_commands(bot)
+    except Exception:
+        log.exception("set_my_commands failed")
+    log.info("Bot started, model=%s/%s, db=%s", config.LLM_PROVIDER, config.LLM_MODEL, config.DB_PATH)
+    await dp.start_polling(bot, handle_as_tasks=True)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

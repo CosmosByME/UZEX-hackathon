@@ -1,0 +1,18 @@
+# Python virtual environment (Mac-only, large, rebuilt on the server)
+.venv
+
+# Secrets: set them in Railway → Variables instead
+.env
+
+# Built locally; the server rebuilds it from data/ during the build
+exchange.duckdb
+exchange.duckdb.tmp
+*.wal
+
+# Not needed on the server
+logs
+tests
+__pycache__
+*.pyc
+.DS_Store
+.git

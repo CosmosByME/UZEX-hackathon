@@ -1,0 +1,43 @@
+# Practice questions. Lines starting with # are skipped.
+# TRAP = the correct answer is "no such data" — the agent must NOT give a number/company/product.
+
+# --- counts and totals ---
+Сколько всего сделок в реестре?
+2025-yilda nechta bitim tuzilgan?
+Сколько сделок было аннулировано в 2024 году и какая доля это от всех сделок года?
+2023-yildagi bitimlarning umumiy summasi qancha (bekor qilinganlarsiz)?
+Какой общий объём экспортных сделок в долларах за 2026 год?
+Сколько сделок исполнено частично?
+
+# --- products ---
+Какой товар принёс наибольший оборот в 2024 году?
+Paxta xom ashyosining 2026-yil sentyabrdagi o‘rtacha narxi qancha?
+Сколько тонн аммиачной селитры продано в 2023 году?
+Qaysi tovar guruhi bo‘yicha eng ko‘p bitim tuzilgan?
+Какой код ТН ВЭД у цемента?
+Средняя цена за килограмм хлопка-сырца 1 сорта по месяцам 2025 года
+
+# --- companies and brokers ---
+Топ-5 покупателей по сумме сделок за 2025 год
+Qaysi broker eng ko‘p bitim tuzgan?
+Pudexiz Plast nechta bitimda sotuvchi bo‘lgan va umumiy summasi qancha?
+Кто продавец и покупатель в сделке номер 504707?
+ҲАРАЙЎМ КИМЁ қайси вилоятда жойлашган?
+Какой продавец чаще всего не получал оплату (больше всего аннулированных сделок)?
+
+# --- regions, time, process ---
+Qaysi viloyatda 2024-yilda eng ko‘p savdo hajmi bo‘lgan?
+В каком месяце 2025 года был максимальный оборот?
+Средний срок от сделки до оплаты в днях по спотовым сделкам
+Курс доллара на 15.06.2024
+Сколько сделок прошло на английском аукционе в 2026 году?
+Какая максимальная сумма одной сделки и кто был покупателем?
+
+# --- TRAPS: must answer "no data" ---
+Сколько сделок было в 2021 году?
+Artel Electronics kompaniyasi nechta bitim qilgan?
+Сколько нефти марки Brent продано на бирже?
+Какая прибыль была у продавцов в 2024 году?
+Birja raisi kim?
+Сколько сделок будет в декабре 2026 года?
+Почему в 2023 году упал оборот цемента?
